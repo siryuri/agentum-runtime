@@ -1,0 +1,180 @@
+# Builds whisper-cli for Windows x64 as ONE self-contained .exe and, when asked,
+# attaches it to the whisper-cli-v1.8.2 release next to the macOS build.
+#
+# Why build it here instead of using upstream's whisper-bin-x64.zip: upstream's
+# Windows build links the Visual C++ runtime as DLLs (MSVCP140, VCRUNTIME140,
+# VCRUNTIME140_1, VCOMP140). A clean Windows install doesn't have them, so
+# whisper-cli.exe would not start there and meetings would get no transcript.
+# This build compiles the runtime in (/MT) and turns OpenMP off (VCOMP140 has no
+# static form), and the "check" step below fails if any of those DLLs is still
+# imported.
+#
+# Runs on every pull request that touches this file (build + checks, nothing
+# published). Publishing is a manual run with `publish: true` on main.
+
+name: whisper-cli (Windows x64)
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/whisper-cli-windows.yml
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Attach the built .exe to the whisper-cli-v1.8.2 release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: whisper-cli-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same source as the macOS asset in this release: whisper.cpp v1.8.2, ggml 0.9.4.
+  WHISPER_TAG: v1.8.2
+  WHISPER_COMMIT: 4979e04f5dcaccb36057e059bbaed8a2f5288315
+  RELEASE_TAG: whisper-cli-v1.8.2
+  ASSET_NAME: whisper-cli-win32-x64.exe
+  # Smallest English model, only used to prove the binary really transcribes.
+  TEST_MODEL_URL: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+  TEST_MODEL_SHA256: 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - name: Fetch whisper.cpp at the pinned commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ env.WHISPER_COMMIT }}
+          path: whisper.cpp
+          persist-credentials: false
+
+      - name: Confirm the tag still points at the pinned commit
+        shell: pwsh
+        working-directory: whisper.cpp
+        run: |
+          $head = git rev-parse HEAD
+          if ($head -ne $env:WHISPER_COMMIT) { throw "checked out $head, expected $env:WHISPER_COMMIT" }
+
+      - name: Configure
+        shell: pwsh
+        working-directory: whisper.cpp
+        # CMP0091=NEW: whisper.cpp's cmake_minimum_required predates 3.15, so
+        # without it CMAKE_MSVC_RUNTIME_LIBRARY is silently ignored and the
+        # build links the runtime DLLs anyway.
+        # GGML_NATIVE=OFF: don't tune for the runner's CPU. ggml then enables
+        # AVX/AVX2/FMA/F16C/BMI2 (/arch:AVX2), which every Windows 11 CPU has.
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
+          -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          -DBUILD_SHARED_LIBS=OFF
+          -DGGML_NATIVE=OFF
+          -DGGML_OPENMP=OFF
+          -DGGML_CCACHE=OFF
+          -DWHISPER_SDL2=OFF
+          -DWHISPER_BUILD_TESTS=OFF
+          -DWHISPER_BUILD_SERVER=OFF
+
+      - name: Build whisper-cli
+        shell: pwsh
+        working-directory: whisper.cpp
+        run: cmake --build build --config Release --target whisper-cli -j 4
+
+      - name: Stage
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item whisper.cpp/build/bin/Release/whisper-cli.exe "out/$env:ASSET_NAME"
+
+      - name: Check it needs nothing but Windows itself
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin not found" }
+          $deps = & $dumpbin /nologo /dependents "out/$env:ASSET_NAME" |
+            Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+          "Imports:"; $deps | ForEach-Object { "  $_" }
+          # Only DLLs that ship with every Windows install are allowed.
+          $allowed = '^(KERNEL32|ADVAPI32|USER32|SHELL32|OLE32|WS2_32|bcrypt|api-ms-win-[a-z0-9-]+)\.dll$'
+          $bad = $deps | Where-Object { $_ -notmatch $allowed }
+          if ($bad) { throw "whisper-cli imports DLLs a clean Windows install may not have: $($bad -join ', ')" }
+
+      - name: Transcribe a sample
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:TEST_MODEL_URL -OutFile tiny.bin
+          $sha = (Get-FileHash tiny.bin -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne $env:TEST_MODEL_SHA256) { throw "model sha256 $sha does not match the pin" }
+          $text = & "out/$env:ASSET_NAME" -m tiny.bin -f whisper.cpp/samples/jfk.wav -nt -t 4 2>$null | Out-String
+          "Transcript: $text"
+          if ($LASTEXITCODE -ne 0) { throw "whisper-cli exited $LASTEXITCODE" }
+          if ($text -notmatch 'ask not what your country can do for you') { throw "unexpected transcript" }
+
+      # Recordings live under %APPDATA%, so a user named José or 小明 has a
+      # non-ASCII path. whisper.cpp opens files with narrow-character APIs, so
+      # this may fail; it is reported here, not enforced, until the desktop
+      # side decides how to handle it (e.g. passing an 8.3 short path).
+      - name: Report whether a non-ASCII path works
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "Zoë 小明"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item whisper.cpp/samples/jfk.wav (Join-Path $dir "jfk.wav")
+          $text = & "out/$env:ASSET_NAME" -m tiny.bin -f (Join-Path $dir "jfk.wav") -nt -t 4 2>$null | Out-String
+          if ($LASTEXITCODE -ne 0 -or $text -notmatch 'ask not') { throw "non-ASCII path FAILED (exit $LASTEXITCODE)" }
+          "non-ASCII path OK"
+
+      - name: Hash
+        id: hash
+        shell: pwsh
+        run: |
+          $sha = (Get-FileHash "out/$env:ASSET_NAME" -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item "out/$env:ASSET_NAME").Length
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          "### $env:ASSET_NAME`n`n| | |`n|---|---|`n| sha256 | ``$sha`` |`n| bytes | $size |`n| source | whisper.cpp $env:WHISPER_TAG ($env:WHISPER_COMMIT) |" >> $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: whisper-cli-win32-x64
+          path: out/${{ env.ASSET_NAME }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: whisper-cli-win32-x64
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          echo "$EXPECTED_SHA256  $ASSET_NAME" | sha256sum -c -
+          # An asset that is already there is never replaced: the desktop app
+          # pins its sha256, so a silent rebuild would break every install.
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -qx "$ASSET_NAME"; then
+            echo "::error::$ASSET_NAME is already attached to $RELEASE_TAG; publish under a new name instead"
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "$ASSET_NAME" -R "$GITHUB_REPOSITORY"
+          notes="$(gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --json body -q .body)"
+          printf '%s\n\n%s\n' "$notes" "Windows x64: $ASSET_NAME, built by .github/workflows/whisper-cli-windows.yml (run $GITHUB_RUN_ID) with the Visual C++ runtime linked in and OpenMP off. sha256 $EXPECTED_SHA256" \
+            | gh release edit "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --notes-file -
