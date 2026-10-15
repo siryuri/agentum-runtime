@@ -1,0 +1,302 @@
+# Builds whisper-cli for Windows x64 with the Vulkan GPU backend, as ONE
+# self-contained .exe, and, when asked, attaches it to the whisper-cli-v1.8.2
+# release next to the macOS build and the Windows CPU build.
+#
+# Vulkan runs on NVIDIA, AMD and Intel graphics alike, and its loader
+# (vulkan-1.dll) is installed by every current GPU driver, so one build covers
+# every PC with a graphics card. The desktop app ships this next to the CPU
+# build and falls back to the CPU build when this one can't start (no driver,
+# so no vulkan-1.dll) or finds no GPU.
+#
+# Like the CPU build: the Visual C++ runtime is linked in (/MT), OpenMP is off
+# (VCOMP140 has no static form) and a UTF-8 code-page manifest is embedded so
+# recordings under a non-ASCII user folder (José, 小明) open. The checks below
+# fail the job if the exe imports anything but Windows' own DLLs and
+# vulkan-1.dll, or if it doesn't transcribe through a real Vulkan device.
+#
+# Runs on every pull request that touches this file (build + checks, nothing
+# published). Publishing is a manual run with `publish: true` on main.
+
+name: whisper-cli (Windows x64, Vulkan)
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/whisper-cli-windows-vulkan.yml
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Attach the built .exe to the whisper-cli-v1.8.2 release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: whisper-cli-windows-vulkan-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same source as the other assets in this release: whisper.cpp v1.8.2, ggml 0.9.4.
+  WHISPER_TAG: v1.8.2
+  WHISPER_COMMIT: 4979e04f5dcaccb36057e059bbaed8a2f5288315
+  RELEASE_TAG: whisper-cli-v1.8.2
+  ASSET_NAME: whisper-cli-win32-x64-vulkan.exe
+  # Build-time only: headers, the vulkan-1.lib import library and the glslc
+  # shader compiler. Nothing from the SDK ends up in the exe. The sha256 is the
+  # one LunarG publishes at
+  # https://sdk.lunarg.com/sdk/sha/1.4.313.2/windows/vulkansdk-windows-X64-1.4.313.2.exe.txt
+  VULKAN_SDK_VERSION: 1.4.313.2
+  VULKAN_SDK_SHA256: 34a921d951858274ca8e470e9d0a3b7624db41216b3908ccea9f73c8a1b7500e
+  # Test-only: Mesa's software Vulkan driver (lavapipe), so the GPU code path
+  # really runs on a runner that has no GPU. The sha256 is the digest GitHub
+  # records for the release asset.
+  MESA_URL: https://github.com/pal1000/mesa-dist-win/releases/download/25.2.5/mesa3d-25.2.5-release-msvc.7z
+  MESA_SHA256: 24b082cd3b66115a7ddb355e69fa0332dd22c751a392ab61ea3f5c9f6c912b88
+  # Smallest English model, only used to prove the binary really transcribes.
+  TEST_MODEL_URL: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+  TEST_MODEL_SHA256: 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - name: Fetch whisper.cpp at the pinned commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ env.WHISPER_COMMIT }}
+          path: whisper.cpp
+          persist-credentials: false
+
+      - name: Confirm the tag still points at the pinned commit
+        shell: pwsh
+        working-directory: whisper.cpp
+        run: |
+          $head = git rev-parse HEAD
+          if ($head -ne $env:WHISPER_COMMIT) { throw "checked out $head, expected $env:WHISPER_COMMIT" }
+
+      - name: Install the Vulkan SDK
+        shell: pwsh
+        run: |
+          $installer = "$env:RUNNER_TEMP\vulkansdk.exe"
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_SDK_VERSION.exe" -OutFile $installer
+          $sha = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne $env:VULKAN_SDK_SHA256) { throw "Vulkan SDK sha256 $sha does not match the pin" }
+          $root = "C:\VulkanSDK\$env:VULKAN_SDK_VERSION"
+          & $installer --root $root --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installer exited $LASTEXITCODE" }
+          if (-not (Test-Path "$root\Bin\glslc.exe")) { throw "glslc.exe missing from $root\Bin" }
+          "VULKAN_SDK=$root" >> $env:GITHUB_ENV
+          "$root\Bin" >> $env:GITHUB_PATH
+
+      # See whisper-cli-windows.yml: whisper.cpp opens files through
+      # narrow-character APIs, so without this a non-ASCII %APPDATA% breaks it.
+      - name: Write the UTF-8 manifest
+        shell: pwsh
+        run: |
+          @'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+            <application xmlns="urn:schemas-microsoft-com:asm.v3">
+              <windowsSettings>
+                <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+              </windowsSettings>
+            </application>
+          </assembly>
+          '@ | Set-Content -Encoding utf8NoBOM "$env:RUNNER_TEMP\utf8.manifest"
+
+      - name: Configure
+        shell: pwsh
+        working-directory: whisper.cpp
+        # The same flags as the CPU build (see whisper-cli-windows.yml for why
+        # each is there), plus GGML_VULKAN=ON. With BUILD_SHARED_LIBS=OFF the
+        # Vulkan backend and its compiled shaders are linked into the exe; the
+        # only new import is vulkan-1.dll, the loader GPU drivers install.
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          "-DCMAKE_EXE_LINKER_FLAGS=/MANIFESTINPUT:$env:RUNNER_TEMP\utf8.manifest"
+          -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
+          -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          -DBUILD_SHARED_LIBS=OFF
+          -DGGML_NATIVE=OFF
+          -DGGML_OPENMP=OFF
+          -DGGML_CCACHE=OFF
+          -DGGML_VULKAN=ON
+          -DWHISPER_SDL2=OFF
+          -DWHISPER_BUILD_TESTS=OFF
+          -DWHISPER_BUILD_SERVER=OFF
+
+      - name: Build whisper-cli
+        shell: pwsh
+        working-directory: whisper.cpp
+        run: cmake --build build --config Release --target whisper-cli -j 4
+
+      - name: Stage
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item whisper.cpp/build/bin/Release/whisper-cli.exe "out/$env:ASSET_NAME"
+
+      - name: Check it needs nothing but Windows and the GPU driver's Vulkan loader
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin not found" }
+          $deps = & $dumpbin /nologo /dependents "out/$env:ASSET_NAME" |
+            Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+          "Imports:"; $deps | ForEach-Object { "  $_" }
+          # vulkan-1.dll must be there (otherwise this isn't the GPU build), and
+          # everything else must ship with every Windows install.
+          if (-not ($deps | Where-Object { $_ -ieq 'vulkan-1.dll' })) { throw "vulkan-1.dll is not imported: the Vulkan backend was not linked in" }
+          $allowed = '^(KERNEL32|ADVAPI32|USER32|SHELL32|OLE32|WS2_32|bcrypt|api-ms-win-[a-z0-9-]+)\.dll$'
+          $bad = $deps | Where-Object { $_ -ine 'vulkan-1.dll' -and $_ -notmatch $allowed }
+          if ($bad) { throw "whisper-cli imports DLLs a PC with a GPU driver may not have: $($bad -join ', ')" }
+
+      - name: Check the UTF-8 manifest is embedded
+        shell: pwsh
+        run: |
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $mt) { throw "mt.exe not found" }
+          & $mt.FullName -nologo "-inputresource:out\$env:ASSET_NAME;#1" "-out:$env:RUNNER_TEMP\embedded.manifest"
+          $m = Get-Content -Raw "$env:RUNNER_TEMP\embedded.manifest"
+          $m
+          if ($m -notmatch '<activeCodePage[^>]*>UTF-8</activeCodePage>') { throw "the UTF-8 code page is not in the embedded manifest" }
+
+      - name: Fetch the test model
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:TEST_MODEL_URL -OutFile tiny.bin
+          $sha = (Get-FileHash tiny.bin -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne $env:TEST_MODEL_SHA256) { throw "model sha256 $sha does not match the pin" }
+
+      # The runner has no GPU, but the SDK install put the Vulkan loader in
+      # System32: the state of a PC (or VM) with a loader and no Vulkan device.
+      # Recorded on the first run: whisper starts, finds no device, says
+      # "whisper_backend_init_gpu: no GPU found" on stderr, and transcribes on
+      # the CPU with exit 0. The desktop app keys its fallback on that line,
+      # so it is asserted here.
+      - name: No GPU, loader present - falls back to the CPU and says so
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "$env:SystemRoot\System32\vulkan-1.dll")) { throw "expected the Vulkan SDK install to put vulkan-1.dll in System32" }
+          $text = & "out/$env:ASSET_NAME" -m tiny.bin -f whisper.cpp/samples/jfk.wav -nt -t 4 2>"$env:RUNNER_TEMP\nogpu.err" | Out-String
+          $err = Get-Content -Raw "$env:RUNNER_TEMP\nogpu.err"
+          "exit $LASTEXITCODE"; "Transcript: $text"; $err | Select-String 'gpu|vulkan|backend'
+          if ($LASTEXITCODE -ne 0) { throw "whisper-cli exited $LASTEXITCODE with no GPU; expected a CPU fallback" }
+          if ($text -notmatch 'ask not what your country can do for you') { throw "unexpected transcript" }
+          if ($err -notmatch 'whisper_backend_init_gpu: no GPU found') { throw "stderr no longer says 'no GPU found'; the desktop app's fallback reads that line" }
+
+      # A real Vulkan device on a runner without a GPU: Mesa's software driver.
+      # Slow (about 17 s for this 11 s sample), but it runs the shaders this
+      # build compiled through Vulkan, so a broken GPU path fails here instead
+      # of on a user's PC.
+      - name: Through a Vulkan device (Mesa lavapipe) - uses the GPU path
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          Invoke-WebRequest -Uri $env:MESA_URL -OutFile "$env:RUNNER_TEMP\mesa.7z"
+          $sha = (Get-FileHash "$env:RUNNER_TEMP\mesa.7z" -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne $env:MESA_SHA256) { throw "Mesa sha256 $sha does not match the pin" }
+          $mesa = Join-Path $env:RUNNER_TEMP "mesa"
+          7z x "$env:RUNNER_TEMP\mesa.7z" "-o$mesa" "x64\vulkan_lvp.dll" "x64\lvp_icd.x86_64.json" -y | Out-Null
+          if (-not (Test-Path "$mesa\x64\vulkan_lvp.dll")) { throw "vulkan_lvp.dll not extracted" }
+          "Vulkan loader: $((Get-Item "$env:SystemRoot\System32\vulkan-1.dll").VersionInfo.FileVersion)"
+          # Registered the way a driver installer does it. The loader ignores
+          # VK_DRIVER_FILES in an elevated process, and the runner is elevated.
+          $key = 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers'
+          New-Item -Path $key -Force | Out-Null
+          New-ItemProperty -Path $key -Name "$mesa\x64\lvp_icd.x86_64.json" -PropertyType DWord -Value 0 -Force | Out-Null
+          # ggml only picks discrete and integrated GPUs on its own; lavapipe
+          # is a CPU-type device, so name it (test-only).
+          $env:GGML_VK_VISIBLE_DEVICES = '0'
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $text = & "out/$env:ASSET_NAME" -m tiny.bin -f whisper.cpp/samples/jfk.wav -nt -t 4 2>"$env:RUNNER_TEMP\lvp.err" | Out-String
+          $err = Get-Content -Raw "$env:RUNNER_TEMP\lvp.err"
+          "exit $LASTEXITCODE after $([int]$sw.Elapsed.TotalSeconds)s"; "Transcript: $text"; $err | Select-String 'gpu|vulkan|backend'
+          if ($LASTEXITCODE -ne 0) { throw "whisper-cli exited $LASTEXITCODE on lavapipe" }
+          if ($err -notmatch 'whisper_backend_init_gpu: using Vulkan0 backend') { throw "whisper did not use the Vulkan device" }
+          if ($text -notmatch 'ask not what your country can do for you') { throw "unexpected transcript through Vulkan" }
+
+      - name: Transcribe from a non-ASCII folder
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "Zoë 小明"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item whisper.cpp/samples/jfk.wav (Join-Path $dir "jfk.wav")
+          Copy-Item tiny.bin (Join-Path $dir "modèle.bin")
+          $text = & "out/$env:ASSET_NAME" -m (Join-Path $dir "modèle.bin") -f (Join-Path $dir "jfk.wav") -nt -t 4 2>$null | Out-String
+          "Transcript: $text"
+          if ($LASTEXITCODE -ne 0) { throw "whisper-cli exited $LASTEXITCODE on a non-ASCII path" }
+          if ($text -notmatch 'ask not what your country can do for you') { throw "unexpected transcript" }
+
+      # A PC with no graphics driver has no vulkan-1.dll at all. Windows then
+      # refuses to load the exe: exit 0xC0000135 (STATUS_DLL_NOT_FOUND) before
+      # whisper runs. The desktop app checks for the loader before starting
+      # this build, and falls back to the CPU build on any non-zero exit.
+      # Hiding System32's copy is safe on a throwaway runner, and this step
+      # runs last so nothing after it needs Vulkan.
+      - name: No vulkan-1.dll at all - fails at once, clearly
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $dll = "$env:SystemRoot\System32\vulkan-1.dll"
+          takeown /f $dll | Out-Null
+          icacls $dll /grant "*S-1-5-32-544:F" | Out-Null
+          Rename-Item $dll "vulkan-1.dll.hidden"
+          if (Test-Path $dll) { throw "could not hide $dll" }
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $p = Start-Process -FilePath "out\$env:ASSET_NAME" -ArgumentList "-m tiny.bin -f whisper.cpp\samples\jfk.wav -nt" -NoNewWindow -Wait -PassThru
+          $code = $p.ExitCode
+          "exit $code (0x$('{0:X8}' -f $code)) after $([int]$sw.Elapsed.TotalMilliseconds) ms"
+          if ($code -ne -1073741515) { throw "expected STATUS_DLL_NOT_FOUND (0xC0000135), got $code" }
+
+      - name: Hash
+        id: hash
+        shell: pwsh
+        run: |
+          $sha = (Get-FileHash "out/$env:ASSET_NAME" -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item "out/$env:ASSET_NAME").Length
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          "$env:ASSET_NAME`: $size bytes, sha256 $sha"
+          "### $env:ASSET_NAME`n`n| | |`n|---|---|`n| sha256 | ``$sha`` |`n| bytes | $size |`n| source | whisper.cpp $env:WHISPER_TAG ($env:WHISPER_COMMIT) |`n| Vulkan SDK | $env:VULKAN_SDK_VERSION |" >> $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: whisper-cli-win32-x64-vulkan
+          path: out/${{ env.ASSET_NAME }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: whisper-cli-win32-x64-vulkan
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          echo "$EXPECTED_SHA256  $ASSET_NAME" | sha256sum -c -
+          # An asset that is already there is never replaced: the desktop app
+          # pins its sha256, so a silent rebuild would break every install.
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -qx "$ASSET_NAME"; then
+            echo "::error::$ASSET_NAME is already attached to $RELEASE_TAG; publish under a new name instead"
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "$ASSET_NAME" -R "$GITHUB_REPOSITORY"
+          notes="$(gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --json body -q .body)"
+          printf '%s\n\n%s\n' "$notes" "Windows x64 with Vulkan GPU: $ASSET_NAME, built by .github/workflows/whisper-cli-windows-vulkan.yml (run $GITHUB_RUN_ID) with the Visual C++ runtime linked in, OpenMP off, a UTF-8 code-page manifest and the Vulkan SDK $VULKAN_SDK_VERSION. Imports vulkan-1.dll, which GPU drivers install. sha256 $EXPECTED_SHA256" \
+            | gh release edit "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --notes-file -
